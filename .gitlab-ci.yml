@@ -1,0 +1,12 @@
+default:
+  image: alicesama/rcore-ci:2024a
+
+stages:
+  - test
+
+test-code-job:
+  stage: test
+  script:
+    - git clone https://token:${rCoreCheckToken}@git.tsinghua.edu.cn/os-lab/2026s/ta/rcore-tutorial-checker.git ci-user
+    - git clone https://token:${rCoreTestToken}@git.tsinghua.edu.cn/os-lab/2026s/public/rcore-tutorial-test.git ci-user/user
+    - cd ci-user && make test CHAPTER=`echo $CI_COMMIT_REF_NAME | grep -oP 'ch\K[0-9]'` OFFLINE=1
