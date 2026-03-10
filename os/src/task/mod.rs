@@ -19,7 +19,7 @@ use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
 use lazy_static::*;
 use switch::__switch;
-pub use task::{TaskControlBlock, TaskStatus};
+pub use task::{TaskControlBlock, TaskStatus, MAX_SYSCALL_NUM};
 
 pub use context::TaskContext;
 
@@ -54,6 +54,7 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
+            syscall_counts: [0; MAX_SYSCALL_NUM],
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
@@ -115,6 +116,26 @@ impl TaskManager {
             .find(|id| inner.tasks[*id].task_status == TaskStatus::Ready)
     }
 
+    /// Increment the syscall count for the current task.
+    fn increment_current_syscall_count(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        if syscall_id < MAX_SYSCALL_NUM {
+            inner.tasks[current].syscall_counts[syscall_id] += 1;
+        }
+    }
+
+    /// Get the syscall count for the current task.
+    fn get_current_syscall_count(&self, syscall_id: usize) -> u32 {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        if syscall_id < MAX_SYSCALL_NUM {
+            inner.tasks[current].syscall_counts[syscall_id]
+        } else {
+            0
+        }
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -168,4 +189,14 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+/// Increment the syscall count for the current task.
+pub fn increment_current_syscall_count(syscall_id: usize) {
+    TASK_MANAGER.increment_current_syscall_count(syscall_id);
+}
+
+/// Get the syscall count for the current task.
+pub fn get_current_syscall_count(syscall_id: usize) -> u32 {
+    TASK_MANAGER.get_current_syscall_count(syscall_id)
 }

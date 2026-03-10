@@ -2,6 +2,9 @@
 
 use super::TaskContext;
 
+/// Maximum number of syscalls supported for counting
+pub const MAX_SYSCALL_NUM: usize = 500;
+
 /// The task control block (TCB) of a task.
 #[derive(Copy, Clone)]
 pub struct TaskControlBlock {
@@ -9,6 +12,8 @@ pub struct TaskControlBlock {
     pub task_status: TaskStatus,
     /// The task context
     pub task_cx: TaskContext,
+    /// Syscall counts for each syscall id
+    pub syscall_counts: [u32; MAX_SYSCALL_NUM],
 }
 
 /// The status of a task
