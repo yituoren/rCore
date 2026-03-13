@@ -266,6 +266,68 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
+    /// Map anonymous memory [start, start+len) with given port flags.
+    pub fn mmap(&mut self, start: usize, len: usize, port: usize) -> isize {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        for area in self.areas.iter() {
+            if area.vpn_range.get_start() < end_vpn && start_vpn < area.vpn_range.get_end() {
+                return -1;
+            }
+        }
+        let mut perm = MapPermission::U;
+        if port & 1 != 0 {
+            perm |= MapPermission::R;
+        }
+        if port & 2 != 0 {
+            perm |= MapPermission::W;
+        }
+        if port & 4 != 0 {
+            perm |= MapPermission::X;
+        }
+        self.push(
+            MapArea::new(start_va, end_va, MapType::Framed, perm),
+            None,
+        );
+        0
+    }
+
+    /// Unmap memory [start, start+len).
+    pub fn munmap(&mut self, start: usize, len: usize) -> isize {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        let mut vpn = start_vpn;
+        while vpn < end_vpn {
+            let found = self.areas.iter().any(|area| {
+                area.vpn_range.get_start() <= vpn && vpn < area.vpn_range.get_end()
+            });
+            if !found {
+                return -1;
+            }
+            vpn.step();
+        }
+        for area in self.areas.iter_mut() {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            if area_start >= end_vpn || area_end <= start_vpn {
+                continue;
+            }
+            let overlap_start = if start_vpn > area_start { start_vpn } else { area_start };
+            let overlap_end = if end_vpn < area_end { end_vpn } else { area_end };
+            let mut vpn = overlap_start;
+            while vpn < overlap_end {
+                area.unmap_one(&mut self.page_table, vpn);
+                vpn.step();
+            }
+        }
+        self.areas.retain(|area| !area.data_frames.is_empty());
+        0
+    }
+
     ///Remove all `MapArea`
     pub fn recycle_data_pages(&mut self) {
         self.areas.clear();
