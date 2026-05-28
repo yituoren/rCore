@@ -25,15 +25,16 @@ SYSCALL_UNLINKAT => sys_unlinkat(args[1] as *const u8),
 
 因此内核侧的两个函数只需要处理路径字符串，dirfd和flags按AT_FDCWD与0的语义被用户库默认填好。
 
-在easy-fs/src/vfs.rs上为Inode新增三个方法支撑硬链接：
+在easy-fs/src/vfs.rs上为Inode新增四个方法支撑硬链接和fstat：
 
 - inode_id：从block_id和block_offset反算inode号，需要EasyFileSystem额外暴露一个get_inode_id方法
+- is_dir：读出DiskInode的type_判断目录或文件，给StatMode区分DIR/FILE使用
 - link(old_name, new_name)：在该目录中查找old_name，找到后追加一个指向同一inode号的新目录项
-- unlink(name)：在该目录中找到name对应的目录项并将其整体清零；随后扫描整个目录确认该inode是否还有其它硬链接，若链接计数归零则调用clear_size释放数据块、再调用新增的EasyFileSystem::dealloc_inode释放inode位图比特
+- unlink(name)：在该目录中找到name对应的目录项并将其整体清零；同一次modify_disk_inode调用里就把"查找目标"、"统计目标inode剩余的硬链接数"、"清零目标槽"三件事一并做完，避免重复获取目录块的cache锁；若链接计数归零则调用clear_size释放数据块、再调用新增的EasyFileSystem::dealloc_inode释放inode位图比特
 
-unlink在置空目录项后通过遍历整个目录重新统计nlink；这一份统计逻辑被提取为link_count方法，sys_fstat也复用它取得Stat.nlink。
+另有一个link_count方法供sys_fstat取Stat.nlink：扫描目录中指向给定inode号的非空条目数。两处扫描都跳过name为空的目录项——这正是unlink遗留的空槽，保证它们既不被算入nlink也不影响find/ls的查找正确性。
 
-link_count扫描时跳过name为空的目录项——这正是unlink遗留的空槽，保证它们既不被算入nlink也不影响find/ls的查找正确性。
+需要注意的是，原版write_at在每次写完后无条件调用block_cache_sync_all，这在ch6_file3那种"50次小写入×10轮"的压力测试下会触发大量虚拟块设备写。BlockCache本身在LRU淘汰时已经通过Drop自动sync脏块，create/link/unlink/clear这些提交点也各自调用了sync_all，所以write_at里的逐次sync是冗余的，去掉后压力测试的吞吐显著上升。
 
 在os/src/fs/mod.rs给Stat加一个new构造函数以减少Stat字段的重复填充。os/src/fs/inode.rs封装两个对ROOT_INODE的薄函数link_at、unlink_at，再供sys_linkat、sys_unlinkat直接调用，syscall层不直接持有ROOT_INODE。
 
