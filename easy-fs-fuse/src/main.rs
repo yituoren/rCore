@@ -1,5 +1,5 @@
 use clap::{App, Arg};
-use easy_fs::{BlockDevice, EasyFileSystem};
+use easy_fs::{block_cache_sync_all, BlockDevice, EasyFileSystem};
 use std::fs::{read_dir, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
@@ -80,6 +80,9 @@ fn easy_fs_pack() -> std::io::Result<()> {
         // write data to easy-fs
         inode.write_at(0, all_data.as_slice());
     }
+    // flush the BlockCache before the host process exits: easy-fs's lazy_static
+    // manager is not dropped, so dirty cache from write_at would otherwise be lost.
+    block_cache_sync_all();
     // list apps
     // for app in root_inode.ls() {
     //     println!("{}", app);
