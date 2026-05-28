@@ -1,4 +1,4 @@
-use super::File;
+use super::{File, Stat, StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
@@ -156,5 +156,38 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn fstat(&self) -> Option<Stat> {
+        let inner = self.inner.exclusive_access();
+        let ino = inner.inode.inode_id();
+        let mode = if inner.inode.is_dir() {
+            StatMode::DIR
+        } else {
+            StatMode::FILE
+        };
+        // hard links to this inode are counted in the root directory
+        let nlink = ROOT_INODE.link_count(ino);
+        Some(Stat::new(ino as u64, mode, nlink))
+    }
+}
+
+/// Create a hard link `new_name` to the file currently named `old_name`
+/// in the root directory. Returns 0 on success, -1 on error.
+pub fn link_at(old_name: &str, new_name: &str) -> isize {
+    if old_name == new_name {
+        return -1;
+    }
+    match ROOT_INODE.link(old_name, new_name) {
+        Some(()) => 0,
+        None => -1,
+    }
+}
+
+/// Remove `name` from the root directory. Returns 0 on success, -1 if `name`
+/// does not exist.
+pub fn unlink_at(name: &str) -> isize {
+    match ROOT_INODE.unlink(name) {
+        Some(()) => 0,
+        None => -1,
     }
 }
