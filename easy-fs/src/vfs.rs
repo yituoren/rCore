@@ -305,3 +305,13 @@ impl Inode {
         Some(())
     }
 }
+
+impl Drop for Inode {
+    fn drop(&mut self) {
+        // flush any dirty blocks touched through this inode before the Arc is
+        // released; this gives easy-fs-fuse (whose lazy_static cache never
+        // drops) a per-file commit point and lets the kernel skip per-write
+        // sync inside write_at.
+        block_cache_sync_all();
+    }
+}
