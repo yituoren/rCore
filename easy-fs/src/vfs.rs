@@ -181,7 +181,8 @@ impl Inode {
             self.increase_size((offset + buf.len()) as u32, disk_inode, &mut fs);
             disk_inode.write_at(offset, buf, &self.block_device)
         });
-        block_cache_sync_all();
+        // dirty blocks are written back lazily by BlockCache::drop on LRU eviction;
+        // commit-point syncs live in create/link/unlink/clear instead of per-write.
         size
     }
     /// Set the file(disk inode) length to zero, delloc all data blocks of the file.
@@ -261,46 +262,42 @@ impl Inode {
     /// hard link to its inode, also free the inode and its data blocks.
     pub fn unlink(&self, name: &str) -> Option<()> {
         let mut fs = self.fs.lock();
-        // locate target dirent
-        let (target_id, target_idx) = self.read_disk_inode(|root_inode| {
+        // single pass: find target, count remaining links to it, then zero its slot
+        let (target_id, nlink) = self.modify_disk_inode(|root_inode| {
             assert!(root_inode.is_dir());
             let file_count = (root_inode.size as usize) / DIRENT_SZ;
             let mut dirent = DirEntry::empty();
-            for i in 0..file_count {
-                assert_eq!(
-                    root_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device),
-                    DIRENT_SZ,
-                );
-                if dirent.name() == name {
-                    return (Some(dirent.inode_id()), Some(i));
-                }
-            }
-            (None, None)
-        });
-        let target_id = target_id?;
-        let target_idx = target_idx?;
-        // zero out the dirent in place; future scans will skip it (empty name)
-        self.modify_disk_inode(|root_inode| {
-            let empty = DirEntry::empty();
-            root_inode.write_at(
-                target_idx * DIRENT_SZ,
-                empty.as_bytes(),
-                &self.block_device,
-            );
-        });
-        // recount links to target_id
-        let nlink = self.read_disk_inode(|root_inode| {
-            let file_count = (root_inode.size as usize) / DIRENT_SZ;
-            let mut cnt: u32 = 0;
-            let mut dirent = DirEntry::empty();
+            let mut target_id: Option<u32> = None;
+            let mut target_idx: Option<usize> = None;
             for i in 0..file_count {
                 root_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device);
-                if dirent.inode_id() == target_id && !dirent.name().is_empty() {
-                    cnt += 1;
+                if dirent.name() == name {
+                    target_id = Some(dirent.inode_id());
+                    target_idx = Some(i);
+                    break;
                 }
             }
-            cnt
+            let (tid, tidx) = match (target_id, target_idx) {
+                (Some(t), Some(i)) => (t, i),
+                _ => return (None, 0u32),
+            };
+            // count other dir entries that still point at this inode (skip the slot we'll clear)
+            let mut nlink: u32 = 0;
+            for i in 0..file_count {
+                if i == tidx {
+                    continue;
+                }
+                root_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device);
+                if dirent.inode_id() == tid && !dirent.name().is_empty() {
+                    nlink += 1;
+                }
+            }
+            // zero the slot in place; future scans skip empty-named entries
+            let empty = DirEntry::empty();
+            root_inode.write_at(tidx * DIRENT_SZ, empty.as_bytes(), &self.block_device);
+            (Some(tid), nlink)
         });
+        let target_id = target_id?;
         if nlink == 0 {
             // last link: free the target inode's data blocks then the inode bitmap bit
             let (tb_id, tb_off) = fs.get_disk_inode_pos(target_id);
