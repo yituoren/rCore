@@ -60,6 +60,80 @@ root inode具体扮演三种角色：
 
 由于easy-fs只有一级目录、所有元信息都集中在root inode上，它的损坏代价基本等同于整个文件系统失效——没有任何冗余目录或fsck机制能从其它路径重新建立映射。
 
+### 举出使用pipe的一个实际应用的例子
+
+shell管道是pipe最常见的实际应用。比如用cat配合wc统计某个文件的行数：
+
+```
+cat /var/log/syslog | wc -l
+```
+
+shell的实现细节：父shell先pipe创建一对管道（读端fd[0]+写端fd[1]）；fork出子进程A，把stdout dup2到fd[1]，关掉两个原始fd，exec("cat")；再fork子进程B，把stdin dup2到fd[0]，关掉两个原始fd，exec("wc -l")；父shell关掉自己的fd[0]和fd[1]，wait两个子进程。整个过程中cat的stdout和wc的stdin被pipe在内核里直接拼起来，两个进程不用知道彼此的pid或预先约定文件，cat退出时写端引用计数归零，wc下一次read返回0感知到EOF自然终止。
+
+类似的常用组合还有ps aux | grep nginx（找特定名字的进程）、dmesg | tail -n 50（看最近的内核日志）等。共同特征是把小而专一的工具用管道串成流水线，每个工具只关心自己的stdin/stdout，组合后能完成相当复杂的任务。
+
+### 多进程通信机制设计
+
+两两建立管道的麻烦在于：N个进程互相通信需要$N(N-1)/2$条管道，每条还要双方都拿到fd（靠fork继承或fd传递），开销大。
+
+设计一个**邮箱**机制：内核维护一张全局邮箱表，每个邮箱由字符串name标识、内部是一个有界FIFO队列。任何进程只要知道name就能往邮箱投递或取走消息，不需要预先和别人握手。
+
+**系统调用接口**：
+
+```rust
+// 创建/打开name邮箱：不存在则按capacity创建，已存在则附加引用；返回fd
+fn sys_mbox_open(name: *const u8, capacity: usize) -> isize;
+
+// 向name邮箱投递一条消息。队列满时按flags决定阻塞或返回-1
+fn sys_mbox_send(name: *const u8, buf: *const u8, len: usize, flags: u32) -> isize;
+
+// 从fd对应邮箱取一条消息。队列空时按flags阻塞或返回-1；返回实际拷贝字节数
+fn sys_mbox_recv(fd: usize, buf: *mut u8, len: usize, flags: u32) -> isize;
+
+// 关闭fd对邮箱的引用；引用归零时邮箱整体回收
+fn sys_mbox_close(fd: usize) -> isize;
+```
+
+flags可包含NONBLOCK（非阻塞）、BROADCAST（广播给所有当前订阅者，相当于pub-sub的topic）。
+
+**内核数据结构**：
+
+```rust
+struct Mailbox {
+    name: String,
+    capacity: usize,
+    queue: VecDeque<Message>,   // 消息环形队列
+    senders: WaitQueue,          // 满时阻塞的发送者
+    receivers: WaitQueue,        // 空时阻塞的接收者
+    ref_count: usize,            // 当前打开它的fd数
+}
+
+struct Message {
+    sender_pid: usize,           // 发件人pid，便于回信
+    payload: Vec<u8>,            // 消息体
+}
+
+static MAILBOX_TABLE: BTreeMap<String, Arc<Mutex<Mailbox>>>;
+```
+
+**通信模式覆盖**：
+
+- 点对点：双方约定name="ch_AB"，A发B收，无需fork继承fd。
+- 多生产者单消费者：name="log_sink"，多个生产者并发send，单个消费者循环recv。
+- 多消费者负载均衡：name="task_queue"，每条消息只交付给某一个recv者（先到先得）。
+- 广播：send带BROADCAST标志时，把消息拷贝到所有当前订阅者的私有队列里。
+
+**相对pair-pipe的优势**：
+
+| 维度 | 两两pipe | 命名邮箱 |
+|:---|:---|:---|
+| 建立通信 | 必须先pipe+fork+dup2/SCM_RIGHTS传fd | 知道name即可open，进程间完全解耦 |
+| N方通信成本 | $O(N^2)$条管道+fd管理 | $O(1)$（共享一个name） |
+| 通信模式 | 单向流，一对一 | 一对一/多对一/一对多/广播都支持 |
+| 消息边界 | 字节流，应用自己分包 | 内核保留消息边界，每次recv取一条完整message |
+| 跨家族进程 | 难，需要传fd | 任意进程只要知道name即可参与 |
+| 发送方身份 | 不携带 | Message里带sender_pid，天然支持回信 |
+
 ## 荣誉准则
 
 在完成本次实验的过程（含此前学习的过程）中，我曾分别与 **以下各位** 就（与本次实验相关的）以下方面做过交流，还在代码中对应的位置以注释形式记录了具体的交流对象及内容：
