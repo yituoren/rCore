@@ -49,6 +49,20 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// banker's algorithm: whether deadlock detection is enabled for this process
+    pub deadlock_detect: bool,
+    /// banker's algorithm: free units per mutex (0/1)
+    pub mutex_available: Vec<i32>,
+    /// banker's algorithm: [tid][mid] mutex units currently held by each thread
+    pub mutex_allocation: Vec<Vec<i32>>,
+    /// banker's algorithm: [tid][mid] mutex units currently requested
+    pub mutex_need: Vec<Vec<i32>>,
+    /// banker's algorithm: mirror of semaphore counts (may be negative)
+    pub sem_count: Vec<i32>,
+    /// banker's algorithm: [tid][sid] semaphore units currently held
+    pub sem_allocation: Vec<Vec<i32>>,
+    /// banker's algorithm: [tid][sid] semaphore units currently requested
+    pub sem_need: Vec<Vec<i32>>,
 }
 
 impl ProcessControlBlockInner {
@@ -119,6 +133,13 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    mutex_available: Vec::new(),
+                    mutex_allocation: Vec::new(),
+                    mutex_need: Vec::new(),
+                    sem_count: Vec::new(),
+                    sem_allocation: Vec::new(),
+                    sem_need: Vec::new(),
                 })
             },
         });
@@ -245,6 +266,13 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    mutex_available: Vec::new(),
+                    mutex_allocation: Vec::new(),
+                    mutex_need: Vec::new(),
+                    sem_count: Vec::new(),
+                    sem_allocation: Vec::new(),
+                    sem_need: Vec::new(),
                 })
             },
         });

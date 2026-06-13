@@ -1,7 +1,18 @@
-use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
+use crate::sync::{ensure_matrix, ensure_vec, is_safe, Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
 use crate::task::{block_current_and_run_next, current_process, current_task};
 use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
+
+/// helper: read current thread's tid
+fn current_tid() -> usize {
+    current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .res
+        .as_ref()
+        .unwrap()
+        .tid
+}
 /// sleep syscall
 pub fn sys_sleep(ms: usize) -> isize {
     trace!(
@@ -41,7 +52,7 @@ pub fn sys_mutex_create(blocking: bool) -> isize {
         Some(Arc::new(MutexBlocking::new()))
     };
     let mut process_inner = process.inner_exclusive_access();
-    if let Some(id) = process_inner
+    let id = if let Some(id) = process_inner
         .mutex_list
         .iter()
         .enumerate()
@@ -49,11 +60,15 @@ pub fn sys_mutex_create(blocking: bool) -> isize {
         .map(|(id, _)| id)
     {
         process_inner.mutex_list[id] = mutex;
-        id as isize
+        id
     } else {
         process_inner.mutex_list.push(mutex);
-        process_inner.mutex_list.len() as isize - 1
-    }
+        process_inner.mutex_list.len() - 1
+    };
+    // record this new mutex as available for the banker's algorithm
+    ensure_vec(&mut process_inner.mutex_available, id + 1);
+    process_inner.mutex_available[id] = 1;
+    id as isize
 }
 /// mutex lock syscall
 pub fn sys_mutex_lock(mutex_id: usize) -> isize {
@@ -68,12 +83,39 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
             .unwrap()
             .tid
     );
+    let tid = current_tid();
+    let mid = mutex_id;
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
-    let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
-    drop(process_inner);
-    drop(process);
+    let mutex;
+    {
+        let mut inner = process.inner_exclusive_access();
+        let n_res = inner.mutex_list.len();
+        ensure_vec(&mut inner.mutex_available, n_res);
+        ensure_matrix(&mut inner.mutex_allocation, tid, n_res);
+        ensure_matrix(&mut inner.mutex_need, tid, n_res);
+        if inner.deadlock_detect {
+            // tentatively register the request and run the banker's check
+            inner.mutex_need[tid][mid] += 1;
+            let safe = is_safe(
+                &inner.mutex_available,
+                &inner.mutex_allocation,
+                &inner.mutex_need,
+            );
+            if !safe {
+                inner.mutex_need[tid][mid] -= 1;
+                return -0xdead;
+            }
+        }
+        mutex = Arc::clone(inner.mutex_list[mid].as_ref().unwrap());
+    }
     mutex.lock();
+    // request granted: move the unit from need to allocation
+    let mut inner = process.inner_exclusive_access();
+    if inner.deadlock_detect {
+        inner.mutex_need[tid][mid] -= 1;
+    }
+    inner.mutex_allocation[tid][mid] += 1;
+    inner.mutex_available[mid] -= 1;
     0
 }
 /// mutex unlock syscall
@@ -89,11 +131,21 @@ pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
             .unwrap()
             .tid
     );
+    let tid = current_tid();
+    let mid = mutex_id;
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
-    let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
-    drop(process_inner);
-    drop(process);
+    let mutex;
+    {
+        let mut inner = process.inner_exclusive_access();
+        let n_res = inner.mutex_list.len();
+        ensure_matrix(&mut inner.mutex_allocation, tid, n_res);
+        if inner.mutex_allocation[tid][mid] > 0 {
+            inner.mutex_allocation[tid][mid] -= 1;
+        }
+        ensure_vec(&mut inner.mutex_available, n_res);
+        inner.mutex_available[mid] += 1;
+        mutex = Arc::clone(inner.mutex_list[mid].as_ref().unwrap());
+    }
     mutex.unlock();
     0
 }
@@ -127,6 +179,9 @@ pub fn sys_semaphore_create(res_count: usize) -> isize {
             .push(Some(Arc::new(Semaphore::new(res_count))));
         process_inner.semaphore_list.len() - 1
     };
+    // mirror semaphore count for the banker's algorithm
+    ensure_vec(&mut process_inner.sem_count, id + 1);
+    process_inner.sem_count[id] = res_count as i32;
     id as isize
 }
 /// semaphore up syscall
@@ -142,10 +197,21 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
             .unwrap()
             .tid
     );
+    let tid = current_tid();
+    let sid = sem_id;
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
-    let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
-    drop(process_inner);
+    let sem;
+    {
+        let mut inner = process.inner_exclusive_access();
+        let n_res = inner.semaphore_list.len();
+        ensure_matrix(&mut inner.sem_allocation, tid, n_res);
+        if inner.sem_allocation[tid][sid] > 0 {
+            inner.sem_allocation[tid][sid] -= 1;
+        }
+        ensure_vec(&mut inner.sem_count, n_res);
+        inner.sem_count[sid] += 1;
+        sem = Arc::clone(inner.semaphore_list[sid].as_ref().unwrap());
+    }
     sem.up();
     0
 }
@@ -162,11 +228,36 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
             .unwrap()
             .tid
     );
+    let tid = current_tid();
+    let sid = sem_id;
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
-    let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
-    drop(process_inner);
+    let sem;
+    {
+        let mut inner = process.inner_exclusive_access();
+        let n_res = inner.semaphore_list.len();
+        ensure_vec(&mut inner.sem_count, n_res);
+        ensure_matrix(&mut inner.sem_allocation, tid, n_res);
+        ensure_matrix(&mut inner.sem_need, tid, n_res);
+        if inner.deadlock_detect {
+            // tentatively register the request, then check safety based on the
+            // currently-free units (sem_count clamped to non-negative)
+            inner.sem_need[tid][sid] += 1;
+            let available: alloc::vec::Vec<i32> = inner.sem_count.iter().map(|&c| c.max(0)).collect();
+            let safe = is_safe(&available, &inner.sem_allocation, &inner.sem_need);
+            if !safe {
+                inner.sem_need[tid][sid] -= 1;
+                return -0xdead;
+            }
+        }
+        sem = Arc::clone(inner.semaphore_list[sid].as_ref().unwrap());
+    }
     sem.down();
+    let mut inner = process.inner_exclusive_access();
+    if inner.deadlock_detect {
+        inner.sem_need[tid][sid] -= 1;
+    }
+    inner.sem_allocation[tid][sid] += 1;
+    inner.sem_count[sid] -= 1;
     0
 }
 /// condvar create syscall
@@ -245,7 +336,12 @@ pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
 /// enable deadlock detection syscall
 ///
 /// YOUR JOB: Implement deadlock detection, but might not all in this syscall
-pub fn sys_enable_deadlock_detect(_enabled: usize) -> isize {
-    trace!("kernel: sys_enable_deadlock_detect NOT IMPLEMENTED");
-    -1
+pub fn sys_enable_deadlock_detect(enabled: usize) -> isize {
+    trace!("kernel: sys_enable_deadlock_detect");
+    if enabled > 1 {
+        return -1;
+    }
+    let process = current_process();
+    process.inner_exclusive_access().deadlock_detect = enabled == 1;
+    0
 }
