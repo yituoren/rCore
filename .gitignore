@@ -21,5 +21,4 @@ pushall.sh
 .vscode/*.log
 *.bak
 ci-user/
-user/
 os/vendor/
